@@ -1,0 +1,5 @@
+# Python 3.11+
+pydantic==2.13.5
+Faker==40.40.0
+pandas==3.0.6
+numpy==2.4.6
