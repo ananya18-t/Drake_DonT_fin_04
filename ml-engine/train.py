@@ -1,15 +1,9 @@
-"""Train and evaluate a transaction-level Isolation Forest.
-
-The model is fitted without ground-truth labels. Labels are used only to
-stratify the evaluation split and calculate held-out diagnostics. Feature
-windows are computed from transactions known up to each event timestamp.
-
-Requires pandas, NumPy, SciPy, joblib, and scikit-learn.
-"""
+"""Train a CUDA autoencoder, Isolation Forest fallback, and XGBoost classifier."""
 
 from __future__ import annotations
 
 import argparse
+import json
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -20,174 +14,156 @@ from sklearn.ensemble import IsolationForest
 from sklearn.metrics import average_precision_score, confusion_matrix, precision_score, recall_score
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import StandardScaler
+from xgboost import XGBClassifier
 
 from feature_extraction import extract_features
+from modeling import fit_autoencoder, reconstruction_errors
 
-
-DEFAULT_DATA_DIR = Path(__file__).resolve().parent.parent / "data-engine" / "data"
+DEFAULT_DATA_DIR = Path(__file__).resolve().parent.parent / "data-engine" / "data" / "round1_baseline"  # transaction model provenance
 DEFAULT_ARTIFACT = Path(__file__).resolve().parent / "artifacts" / "model.pkl"
+SCENARIOS = ("BENIGN", "STRUCTURING", "CIRCULAR_FLOW")
 
 
 @dataclass(frozen=True)
 class TrainingResult:
-    """Held-out evaluation and score-correlation diagnostics."""
+    """Artifact, holdout metrics, and autoencoder training device."""
 
-    metrics: dict[str, float]
+    metrics: dict[str, dict[str, float]]
+    artifact_path: Path
+    device: str
     test_count: int
     test_positive_count: int
-    feature_correlations: tuple[tuple[str, float], ...]
-    artifact_path: Path
+    top_anomaly_correlations: tuple[tuple[str, float], ...]
 
 
-def _load_labeled_data(data_dir: Path) -> tuple[pd.DataFrame, np.ndarray]:
-    """Load the canonical files and align binary labels by transaction ID."""
-    transactions = pd.read_csv(data_dir / "transactions.csv", dtype={"tx_id": "string"})
-    labels = pd.read_csv(data_dir / "ground_truth_labels.csv", dtype="string")
-    if "target_id" in labels:
-        # Canonical data-engine format: one row per entity, keep transaction rows.
-        if "target_type" in labels:
-            labels = labels[labels["target_type"].str.upper().eq("TRANSACTION")]
-        labels = labels.rename(columns={"target_id": "tx_id"})
-    if "tx_id" not in transactions or "tx_id" not in labels:
-        raise ValueError("transactions and ground_truth_labels must both contain tx_id")
-    if transactions["tx_id"].isna().any() or transactions["tx_id"].duplicated().any():
-        raise ValueError("transactions contains missing or duplicate tx_id values")
-    if labels["tx_id"].isna().any() or labels["tx_id"].duplicated().any():
-        raise ValueError("ground_truth_labels contains missing or duplicate tx_id values")
-
-    label_column = next((name for name in ("is_suspicious", "label") if name in labels), None)
-    if label_column is None:
-        raise ValueError("ground_truth_labels must contain is_suspicious or label")
-    raw_labels = labels.set_index("tx_id")[label_column].reindex(transactions["tx_id"])
-    if raw_labels.isna().any():
-        raise ValueError("ground_truth_labels is missing labels for one or more transactions")
-    normalized = raw_labels.astype("string").str.strip().str.lower().map(
-        {"0": 0, "1": 1, "false": 0, "true": 1, "benign": 0, "suspicious": 1}
-    )
-    if normalized.isna().any():
-        raise ValueError("ground_truth_labels must contain 0/1, true/false, or SUSPICIOUS/BENIGN values")
-    return transactions, normalized.to_numpy(dtype=np.int8)
+def _load_data(data_dir: Path) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, np.ndarray]:
+    """Align transaction labels without admitting IDs or labels into X."""
+    tx = pd.read_csv(data_dir / "transactions.csv", dtype={"tx_id": "string"})
+    logs = pd.read_csv(data_dir / "access_logs.csv")
+    accounts = pd.read_csv(data_dir / "accounts.csv")
+    labels = pd.read_csv(data_dir / "ground_truth_labels.csv", dtype={"target_id": "string"})
+    if tx.tx_id.isna().any() or tx.tx_id.duplicated().any():
+        raise ValueError("transactions must have unique non-null tx_id")
+    labels = labels.loc[labels.target_type.eq("TRANSACTION")]
+    if labels.target_id.duplicated().any():
+        raise ValueError("duplicate transaction labels")
+    joined = labels.set_index("target_id").reindex(tx.tx_id)
+    if joined.label.isna().any():
+        raise ValueError("every transaction requires a label")
+    tags = joined.scenario_tag.astype(str)
+    suspicious = joined.label.eq("SUSPICIOUS").to_numpy()
+    classes = np.where(tags.eq("SCENARIO_B_CIRCULAR_MONEY_FLOW"), 2,
+              np.where(tags.eq("SCENARIO_A_SMURFING_INSIDER_HELP"), 1, 0)).astype(np.int8)
+    if np.any(suspicious != (classes > 0)):
+        raise ValueError("transaction labels and scenario tags disagree")
+    return tx, logs, accounts, classes
 
 
-def _feature_correlations(
-    matrix: np.ndarray, scores: np.ndarray, names: tuple[str, ...]
-) -> tuple[tuple[str, float], ...]:
-    """Rank signed Pearson correlations as a descriptive importance proxy."""
-    ranked: list[tuple[str, float]] = []
-    score_std = float(np.std(scores))
-    for column, name in enumerate(names):
-        values = matrix[:, column]
-        if len(values) < 2 or score_std == 0 or float(np.std(values)) == 0:
-            correlation = 0.0
-        else:
-            correlation = float(np.corrcoef(values, scores)[0, 1])
-            if not np.isfinite(correlation):
-                correlation = 0.0
-        ranked.append((name, correlation))
-    return tuple(sorted(ranked, key=lambda item: abs(item[1]), reverse=True))
+def _metrics(y_true: np.ndarray, scores: np.ndarray, predicted: np.ndarray) -> dict[str, float]:
+    """Return transaction detection metrics and false positive rate."""
+    truth = (y_true > 0).astype(int)
+    tn, fp, _, _ = confusion_matrix(truth, predicted, labels=[0, 1]).ravel()
+    return {
+        "precision": float(precision_score(truth, predicted, zero_division=0)),
+        "recall": float(recall_score(truth, predicted, zero_division=0)),
+        "pr_auc": float(average_precision_score(truth, scores)),
+        "false_positive_rate": float(fp / (fp + tn)) if fp + tn else 0.0,
+    }
 
 
 def train_model(
     data_dir: str | Path = DEFAULT_DATA_DIR,
     artifact_path: str | Path = DEFAULT_ARTIFACT,
     *,
-    test_size: float = 0.25,
-    contamination: float = 0.05,
+    epochs: int = 20,
+    device: str | None = None,
     random_state: int = 42,
 ) -> TrainingResult:
-    """Fit an unlabeled model, evaluate on held-out rows, and save artifacts.
-
-    The saved joblib dictionary contains ``model``, ``scaler``, and ordered
-    ``feature_names``. At inference, call ``extract_features`` with historical
-    context, transform with the saved scaler, then use the model. Larger
-    values of ``-model.decision_function(X_scaled)`` mean more anomalous.
-    """
-    if not 0 < test_size < 1:
-        raise ValueError("test_size must be between 0 and 1")
-    if not 0 < contamination <= 0.5:
-        raise ValueError("contamination must be in (0, 0.5]")
-
-    source_dir = Path(data_dir)
-    target = Path(artifact_path)
-    transactions, labels = _load_labeled_data(source_dir)
-    if len(transactions) < 8:
-        raise ValueError("at least 8 transactions are required for a hold-out evaluation")
-
-    accounts = pd.read_csv(source_dir / "accounts.csv", dtype={"account_id": "string"})
-    access_logs = pd.read_csv(source_dir / "access_logs.csv", dtype={"account_id": "string"})
-    X, feature_names = extract_features(transactions, access_logs=access_logs, accounts=accounts)
+    """Fit all tiers and save a single trusted, versioned model bundle."""
+    tx, logs, accounts, labels = _load_data(Path(data_dir))
+    X, names = extract_features(tx, logs, accounts)
     if not np.isfinite(X).all():
-        raise ValueError("feature extraction produced non-finite values")
-
-    indices = np.arange(len(transactions))
-    classes, counts = np.unique(labels, return_counts=True)
-    can_stratify = (
-        len(classes) == 2
-        and counts.min() >= 2
-        and round(len(indices) * test_size) >= 2
-        and len(indices) - round(len(indices) * test_size) >= 2
+        raise ValueError("feature matrix contains non-finite values")
+    indices = np.arange(len(X))
+    train_idx, test_idx = train_test_split(indices, test_size=0.25, random_state=random_state, stratify=labels)
+    normal_idx = train_idx[labels[train_idx] == 0]
+    scaler = StandardScaler().fit(X[normal_idx])
+    scaled_train = scaler.transform(X[train_idx]).astype(np.float32)
+    scaled_test = scaler.transform(X[test_idx]).astype(np.float32)
+    normal_scaled = scaler.transform(X[normal_idx]).astype(np.float32)
+    ae_state, actual_device = fit_autoencoder(normal_scaled, epochs=epochs, device=device, seed=random_state)
+    normal_errors = np.sort(reconstruction_errors(normal_scaled, ae_state, device=actual_device))
+    test_errors = reconstruction_errors(scaled_test, ae_state, device=actual_device)
+    ae_threshold = float(np.quantile(normal_errors, 0.99))
+    fallback = IsolationForest(n_estimators=150, contamination=0.03, random_state=random_state, n_jobs=-1)
+    fallback.fit(scaled_train)
+    fallback_reference = np.sort(-fallback.decision_function(scaled_train))
+    fallback_scores = -fallback.decision_function(scaled_test)
+    classifier = XGBClassifier(
+        objective="multi:softprob", num_class=3, n_estimators=180,
+        max_depth=3, learning_rate=0.05, subsample=0.9,
+        colsample_bytree=0.9, tree_method="hist", device="cpu",
+        eval_metric="mlogloss", random_state=random_state, n_jobs=4,
     )
-    train_idx, test_idx = train_test_split(
-        indices, test_size=test_size, random_state=random_state,
-        stratify=labels if can_stratify else None,
-    )
-    scaler = StandardScaler().fit(X[train_idx])
-    X_train = scaler.transform(X[train_idx])
-    X_test = scaler.transform(X[test_idx])
-    model = IsolationForest(
-        n_estimators=200, contamination=contamination, random_state=random_state, n_jobs=-1
-    ).fit(X_train)
-    training_score_reference = np.sort(-model.decision_function(X_train))
-
-    y_test = labels[test_idx]
-    anomaly_scores = -model.decision_function(X_test)
-    predictions = (model.predict(X_test) == -1).astype(np.int8)
-    tn, fp, _, _ = confusion_matrix(y_test, predictions, labels=[0, 1]).ravel()
+    counts = np.bincount(labels[train_idx], minlength=3)
+    weights = (len(train_idx) / (3 * counts[labels[train_idx]])).astype(np.float32)
+    classifier.fit(X[train_idx].astype(np.float32), labels[train_idx], sample_weight=weights)
+    probabilities = classifier.predict_proba(X[test_idx].astype(np.float32))
+    predicted_class = np.argmax(probabilities, axis=1)
     metrics = {
-        "precision": float(precision_score(y_test, predictions, zero_division=0)),
-        "recall": float(recall_score(y_test, predictions, zero_division=0)),
-        # Average precision summarizes the precision-recall curve.
-        "pr_auc": float(average_precision_score(y_test, anomaly_scores)) if y_test.any() else float("nan"),
-        "false_positive_rate": float(fp / (fp + tn)) if fp + tn else float("nan"),
+        "autoencoder": _metrics(labels[test_idx], test_errors, (test_errors > ae_threshold).astype(int)),
+        "isolation_forest": _metrics(labels[test_idx], fallback_scores, (fallback.predict(scaled_test) == -1).astype(int)),
+        "xgboost": _metrics(labels[test_idx], probabilities[:, 1:].sum(axis=1), (predicted_class > 0).astype(int)),
     }
-    correlations = _feature_correlations(X[test_idx], anomaly_scores, feature_names)
-
+    metrics["xgboost"]["scenario_accuracy"] = float(np.mean(predicted_class == labels[test_idx]))
+    metrics["xgboost"]["circular_recall"] = float(np.mean(predicted_class[labels[test_idx] == 2] == 2))
+    correlations: list[tuple[str, float]] = []
+    for column, name in enumerate(names):
+        values = X[test_idx, column]
+        coefficient = float(np.corrcoef(values, test_errors)[0, 1]) if np.std(values) and np.std(test_errors) else 0.0
+        correlations.append((name, coefficient if np.isfinite(coefficient) else 0.0))
+    ranked_correlations = tuple(sorted(correlations, key=lambda item: abs(item[1]), reverse=True))
+    target = Path(artifact_path)
     target.parent.mkdir(parents=True, exist_ok=True)
-    joblib.dump(
-        {
-            "model": model,
-            "scaler": scaler,
-            "feature_names": feature_names,
-            "score_direction": "higher_is_more_anomalous",
-            "decision_threshold": 0.0,
-            "contamination": contamination,
-            "training_score_reference": training_score_reference,
-        },
-        target,
-    )
-    return TrainingResult(metrics, len(test_idx), int(y_test.sum()), correlations, target)
+    joblib.dump({
+        "version": 2, "feature_names": names, "scenarios": SCENARIOS,
+        "scaler": scaler, "autoencoder": ae_state,
+        "ae_reference": normal_errors, "ae_threshold": ae_threshold,
+        "fallback": fallback, "fallback_reference": fallback_reference,
+        "classifier": classifier, "metrics": metrics,
+        "training_device": actual_device,
+    }, target, compress=3)
+    target.with_suffix(".metrics.json").write_text(json.dumps({
+        "device": actual_device, "test_count": len(test_idx),
+        "test_positive_count": int(np.sum(labels[test_idx] > 0)),
+        "test_circular_count": int(np.sum(labels[test_idx] == 2)),
+        "metrics": metrics,
+        "top_anomaly_score_correlations": ranked_correlations[:10],
+        "note": "Synthetic repeated-template row holdout; not a prospective deployment estimate.",
+    }, indent=2), encoding="utf-8")
+    return TrainingResult(metrics, target, actual_device, len(test_idx), int(np.sum(labels[test_idx] > 0)), ranked_correlations[:10])
 
 
 def main() -> None:
-    """Train from the standard data directory or CLI overrides."""
+    """Train from the project dataset or CLI paths."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--data-dir", type=Path, default=DEFAULT_DATA_DIR)
     parser.add_argument("--artifact", type=Path, default=DEFAULT_ARTIFACT)
-    parser.add_argument("--test-size", type=float, default=0.25)
-    parser.add_argument("--contamination", type=float, default=0.05)
-    parser.add_argument("--random-state", type=int, default=42)
+    parser.add_argument("--epochs", type=int, default=20)
+    parser.add_argument("--device", choices=("cpu", "cuda"), default=None)
+    parser.add_argument("--case-dataset", type=Path, help="Train final-round case models from explicitly split JSONL")
     args = parser.parse_args()
-    result = train_model(
-        data_dir=args.data_dir, artifact_path=args.artifact, test_size=args.test_size,
-        contamination=args.contamination, random_state=args.random_state,
-    )
-    print(f"Held-out transactions: {result.test_count} ({result.test_positive_count} suspicious)")
-    for name, value in result.metrics.items():
-        print(f"{name}: {value:.4f}" if np.isfinite(value) else f"{name}: N/A (class absent in hold-out)")
-    print("Top anomaly-score correlations (descriptive, not causal model importances):")
-    for name, value in result.feature_correlations[:10]:
-        print(f"  {name}: {value:+.4f}")
-    print(f"Saved model and scaler: {result.artifact_path}")
+    if args.case_dataset:
+        from case_training import train_case_model
+        case_artifact = args.artifact if args.artifact != DEFAULT_ARTIFACT else DEFAULT_ARTIFACT.parent / "final_round" / "case_model.pkl"
+        print(json.dumps(train_case_model(args.case_dataset, case_artifact, epochs=args.epochs,
+                                         device=args.device), indent=2))
+        return
+    result = train_model(args.data_dir, args.artifact, epochs=args.epochs, device=args.device)
+    print(json.dumps({"device": result.device, "test_count": result.test_count,
+                      "test_positive_count": result.test_positive_count,
+                      "metrics": result.metrics, "top_anomaly_score_correlations": result.top_anomaly_correlations,
+                      "artifact": str(result.artifact_path)}, indent=2))
 
 
 if __name__ == "__main__":

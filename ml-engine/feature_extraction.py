@@ -1,13 +1,15 @@
 """Create numeric, transaction-level features from ledger and audit records.
 
 All timestamps are interpreted as UTC when no timezone is supplied. Rolling
-windows include transactions at the lower boundary and all transactions at the
+windows include transactions at the lower boundary and earlier rows at the
 same timestamp. The returned matrix keeps the input transaction order.
 """
 
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
+from collections import deque
+from bisect import bisect_left
 from pathlib import Path
 from typing import Any, TypeAlias
 
@@ -38,6 +40,7 @@ FEATURE_NAMES: tuple[str, ...] = (
     "last_access_override_alert",
     "is_dormant_sender",
     "account_missing",
+    "closes_3hop_cycle_48h",
 )
 
 
@@ -58,23 +61,6 @@ def _to_frame(source: RecordSource | None, label: str) -> pd.DataFrame:
     raise TypeError(f"{label} must be a CSV path, DataFrame, mapping, or sequence of mappings")
 
 
-# Canonical data-engine column names mapped to the names used internally.
-_COLUMN_ALIASES: dict[str, str] = {
-    "sender_account": "sender_account_id",
-    "receiver_account": "receiver_account_id",
-    "action": "action_type",
-}
-
-
-def _normalize_columns(frame: pd.DataFrame) -> pd.DataFrame:
-    """Rename canonical schema columns unless the internal name already exists."""
-    renames = {
-        alias: name for alias, name in _COLUMN_ALIASES.items()
-        if alias in frame.columns and name not in frame.columns
-    }
-    return frame.rename(columns=renames) if renames else frame
-
-
 def _require(frame: pd.DataFrame, columns: tuple[str, ...], label: str) -> None:
     """Reject malformed nonempty inputs with an actionable error."""
     missing = sorted(set(columns).difference(frame.columns))
@@ -86,6 +72,15 @@ def _clean_id(series: pd.Series) -> pd.Series:
     """Normalize account identifiers without merging null or blank accounts."""
     values = series.astype("string").str.strip()
     return values.mask(values.eq(""))
+
+
+def _normalize_columns(frame: pd.DataFrame, aliases: dict[str, str], label: str) -> pd.DataFrame:
+    """Accept teammate CSV names and API names without ambiguous duplicates."""
+    rename = {old: new for old, new in aliases.items() if old in frame.columns and new not in frame.columns}
+    for old, new in aliases.items():
+        if old in frame.columns and new in frame.columns:
+            raise ValueError(f"{label} contains both {old} and {new}")
+    return frame.rename(columns=rename)
 
 
 def _window_features(
@@ -117,12 +112,54 @@ def _window_features(
         values = ordered["amount"].to_numpy(dtype=np.float64)
         positions = ordered["position"].to_numpy(dtype=np.int64)
         prefix = np.concatenate(([0.0], np.cumsum(values, dtype=np.float64)))
-        ends = np.searchsorted(times, times, side="right")
+        ends = np.arange(1, len(times) + 1)
         for hours in (1, 6, 24):
             lower = times - np.int64(hours * 3_600_000_000_000)
             starts = np.searchsorted(times, lower, side="left")
             result[f"tx_count_{hours}h"][positions] = ends - starts
             result[f"tx_sum_{hours}h"][positions] = prefix[ends] - prefix[starts]
+    return result
+
+
+def _cycle_features(transactions: pd.DataFrame, timestamps: pd.Series) -> np.ndarray:
+    """Flag a transfer that closes a two or three edge money flow within 48h."""
+    result = np.zeros(len(transactions), dtype=np.float64)
+    if "receiver_account_id" not in transactions:
+        return result
+    ordered = pd.DataFrame({
+        "sender": _clean_id(transactions["sender_account_id"]),
+        "receiver": _clean_id(transactions["receiver_account_id"]),
+        "time": timestamps,
+        "position": np.arange(len(transactions)),
+    }).dropna(subset=["sender", "receiver", "time"]).sort_values(["time", "position"], kind="stable")
+    edges: deque[tuple[int, str, str]] = deque()
+    graph: dict[str, dict[str, deque[int]]] = {}
+    horizon = 48 * 3_600_000_000_000
+    for row in ordered.itertuples(index=False):
+        current_ns = int(row.time.value)
+        while edges and edges[0][0] < current_ns - horizon:
+            _, old_sender, old_receiver = edges.popleft()
+            neighbors = graph[old_sender]
+            neighbors[old_receiver].popleft()
+            if not neighbors[old_receiver]:
+                del neighbors[old_receiver]
+            if not neighbors:
+                del graph[old_sender]
+        # A -> B, B -> C, C -> A: before C -> A there is A -> B -> C.
+        reverse_times = graph.get(row.receiver, {}).get(row.sender, ())
+        direct = bool(reverse_times and reverse_times[0] < current_ns)
+        two_hop = False
+        for mid, first_times in graph.get(row.receiver, {}).items():
+            if mid in {row.sender, row.receiver}:
+                continue
+            second_times = graph.get(mid, {}).get(row.sender, ())
+            end = bisect_left(second_times, current_ns)
+            if end and first_times[0] < second_times[end - 1]:
+                two_hop = True
+                break
+        result[row.position] = float(row.sender != row.receiver and (direct or two_hop))
+        graph.setdefault(row.sender, {}).setdefault(row.receiver, deque()).append(current_ns)
+        edges.append((current_ns, row.sender, row.receiver))
     return result
 
 
@@ -220,11 +257,12 @@ def extract_features(
     if not np.isfinite(limit_proximity) or limit_proximity < 0:
         raise ValueError("limit_proximity must be a nonnegative finite number")
 
-    tx = _normalize_columns(_to_frame(transactions, "transactions")).reset_index(drop=True)
+    tx = _to_frame(transactions, "transactions").reset_index(drop=True)
     if tx.empty:
         return np.empty((0, len(FEATURE_NAMES)), dtype=np.float64), FEATURE_NAMES
+    tx = _normalize_columns(tx, {"sender_account": "sender_account_id", "receiver_account": "receiver_account_id", "type": "channel"}, "transactions")
     _require(tx, ("sender_account_id", "amount", "timestamp"), "transactions")
-    logs = _normalize_columns(_to_frame(access_logs, "access_logs"))
+    logs = _normalize_columns(_to_frame(access_logs, "access_logs"), {"action": "action_type"}, "access_logs")
     account_rows = _to_frame(accounts, "accounts")
 
     amount = pd.to_numeric(tx["amount"], errors="coerce").astype(float)
@@ -243,8 +281,19 @@ def extract_features(
     columns["below_reporting_limit"] = amount.lt(reporting_limit).fillna(False).to_numpy(dtype=np.float64)
     columns.update(_access_features(tx, timestamps, logs))
     columns.update(_account_features(tx, account_rows))
+    columns["closes_3hop_cycle_48h"] = _cycle_features(tx, timestamps)
     X = np.column_stack([columns[name] for name in FEATURE_NAMES]).astype(np.float64, copy=False)
     return X, FEATURE_NAMES
 
 
-__all__ = ["FEATURE_NAMES", "extract_features"]
+def extract_case_features(
+    events: Sequence[Mapping[str, Any]], *, as_of: str,
+    observed_until: str | None = None, accounts: Sequence[Mapping[str, Any]] = (),
+) -> tuple[np.ndarray, tuple[str, ...]]:
+    """Return the separate case matrix registry without changing legacy models."""
+    from graph_temporal_features import CASE_FEATURE_NAMES, build_case_features
+    return build_case_features(events, as_of=as_of, observed_until=observed_until,
+                               accounts=accounts).matrix(), CASE_FEATURE_NAMES
+
+
+__all__ = ["FEATURE_NAMES", "extract_features", "extract_case_features"]

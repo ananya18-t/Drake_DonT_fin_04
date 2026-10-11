@@ -1,0 +1,27 @@
+# Local Python environments and generated caches
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Private configuration and local LLM downloads
+.env
+.env.*
+!.env.example
+*.gguf
+*.safetensors
+
+# Third-party CERT data: regenerate using download_cert.py and prepare_cert_benchmark.py.
+/benchmark/cert/
+
+# Unpublished registry candidates stay local; promoted releases are versioned.
+/releases/candidates/
+
+# Local logs and operating system files
+*.log
+logs/
+.DS_Store
+Thumbs.db
